@@ -2,9 +2,11 @@ package main
 
 import (
 	"context"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
@@ -111,5 +113,85 @@ func TestRateLimitRetryRoundTripper_StandardBackoff(t *testing.T) {
 
 	if resp.StatusCode != http.StatusOK {
 		t.Errorf("Expected final status code 200, got %d", resp.StatusCode)
+	}
+}
+
+type mockRoundTripper struct {
+	roundTrip func(*http.Request) (*http.Response, error)
+}
+
+func (m *mockRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	return m.roundTrip(req)
+}
+
+type trackingBody struct {
+	io.Reader
+	closed  bool
+	drained bool
+}
+
+func (tb *trackingBody) Read(p []byte) (n int, err error) {
+	n, err = tb.Reader.Read(p)
+	if err == io.EOF {
+		tb.drained = true
+	}
+	return n, err
+}
+
+func (tb *trackingBody) Close() error {
+	tb.closed = true
+	return nil
+}
+
+func TestRateLimitRetryRoundTripper_ConnectionClose(t *testing.T) {
+	firstBody := &trackingBody{Reader: strings.NewReader("rate limit error message")}
+	secondBody := &trackingBody{Reader: strings.NewReader("success")}
+
+	attempts := 0
+	rt := &RateLimitRetryRoundTripper{
+		Transport: &mockRoundTripper{
+			roundTrip: func(req *http.Request) (*http.Response, error) {
+				attempts++
+				if attempts == 1 {
+					header := make(http.Header)
+					header.Set("X-RateLimit-Remaining", "0")
+					header.Set("X-RateLimit-Reset", strconv.FormatInt(time.Now().Add(1*time.Second).Unix(), 10))
+					return &http.Response{
+						StatusCode: http.StatusForbidden,
+						Header:     header,
+						Body:       firstBody,
+					}, nil
+				}
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Body:       secondBody,
+				}, nil
+			},
+		},
+		MaxRetries: 1,
+		SleepFunc:  func(d time.Duration) {},
+	}
+
+	req, err := http.NewRequestWithContext(context.Background(), "GET", "http://example.com", nil)
+	if err != nil {
+		t.Fatalf("Failed to create request: %v", err)
+	}
+
+	resp, err := rt.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("RoundTrip failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if attempts != 2 {
+		t.Errorf("Expected 2 attempts, got %d", attempts)
+	}
+
+	if !firstBody.closed {
+		t.Error("Expected first response body to be closed")
+	}
+
+	if !firstBody.drained {
+		t.Error("Expected first response body to be drained")
 	}
 }
