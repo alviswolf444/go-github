@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"strconv"
 	"time"
@@ -68,13 +69,19 @@ func (rt *RateLimitRetryRoundTripper) RoundTrip(req *http.Request) (*http.Respon
 						} else {
 							select {
 							case <-clonedReq.Context().Done():
-								resp.Body.Close()
+								if resp.Body != nil {
+									io.Copy(io.Discard, resp.Body)
+									resp.Body.Close()
+								}
 								return nil, clonedReq.Context().Err()
 							case <-time.After(sleepDuration):
 							}
 						}
 
-						resp.Body.Close()
+						if resp.Body != nil {
+							io.Copy(io.Discard, resp.Body)
+							resp.Body.Close()
+						}
 						continue
 					}
 				}
